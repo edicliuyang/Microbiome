@@ -1,7 +1,6 @@
 # microDBiT: Spatial Microbiome Sequencing
 
-![microDBiT overview](images/marr_pic.jpg)  
-[View Slides](pdfs/ProjMarr_slides.pdf)
+![microDBiT overview](images/microDBiT.png)  
 
 **microDBiT** is a microfluidic-based spatial transcriptomics platform that enables simultaneous, high-resolution profiling of host and microbial RNAs—including both mRNA and rRNA—within the same tissue section.
 
