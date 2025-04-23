@@ -24,13 +24,7 @@ This technology opens new avenues for studying host-microbiome interactions at s
 ## 📁 Repository Contents
 
 - `python/` — Scripts and notebooks used in the original data analysis pipeline  
-- `pdfs/` — Project presentation materials  
 - `images/` — Figures and diagrams used in publications or slides
-
----
-
-## 📄 Citation
-Coming soon. For now, please refer to the project slides or contact the authors for citation information.
 
 ---
 
