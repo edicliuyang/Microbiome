@@ -64,6 +64,9 @@ cfg <- list(
 
   violin_ylim  = 300,
   cor_threshold = 0.3,
+
+  # Seurat PCA settings (for elbow plot)
+  seurat_dims = 1:10,   # adjust after inspecting the elbow plot
   out_dir = "results"
 )
 
@@ -73,6 +76,8 @@ cfg <- list(
 ## ============================================================
 
 suppressPackageStartupMessages({
+  library(Seurat)
+  library(Matrix)
   library(ggplot2)
   library(dplyr)
   library(tidyr)
@@ -194,7 +199,190 @@ msg("Loaded %d spots, %d bacterial genes detected.",
 
 
 ## ============================================================
-## 4) PER-SPECIES SPATIAL UMI MAPS
+## 4) PCA ELBOW PLOT (host genes)
+## ============================================================
+
+# Host genes: exclude bacterial, mitochondrial, and Gm pseudogenes
+gene_cols  <- setdiff(colnames(raw), "X")
+bact_genes <- grep(paste0("^(", paste(cfg$prefixes, collapse = "|"), ")_"),
+                   gene_cols, value = TRUE)
+host_cols  <- setdiff(gene_cols, c(bact_genes, "unmapped"))
+host_cols  <- host_cols[!grepl("^(Gm|mt-|Mt-|MT-|Rn18s|Rn28s|Rn5s)", host_cols)]
+
+rownames(raw) <- raw$X
+
+# Keep only spots with at least 1 host gene detected (avoids log(0) in SCTransform)
+host_counts <- rowSums(raw[, host_cols, drop = FALSE])
+keep_spots  <- names(host_counts)[host_counts > 0]
+msg("%d / %d spots retained after removing zero-count spots.",
+    length(keep_spots), nrow(raw))
+
+mat  <- Matrix::Matrix(as.matrix(t(raw[keep_spots, host_cols])), sparse = TRUE)
+pbmc <- CreateSeuratObject(mat, min.cells = 1, min.features = 1,
+                           project = "ColonMix")
+pbmc <- PercentageFeatureSet(pbmc, pattern = "^MT-", col.name = "percent.mt")
+pbmc <- SCTransform(pbmc, vars.to.regress = "percent.mt", verbose = FALSE)
+pbmc <- RunPCA(pbmc, verbose = FALSE)
+
+# Variance explained by each PC
+pca_stdev    <- pbmc[["pca"]]@stdev
+pct_var      <- pca_stdev^2 / sum(pca_stdev^2) * 100
+cum_var_10   <- round(sum(pct_var[1:max(cfg$seurat_dims)]), 1)
+msg("First %d PCs explain %.1f%% of total variance.", max(cfg$seurat_dims), cum_var_10)
+
+p_elbow <- ElbowPlot(pbmc, ndims = 30) +
+  geom_vline(xintercept = max(cfg$seurat_dims), linetype = "dashed",
+             color = "red", linewidth = 0.8) +
+  annotate("text", x = max(cfg$seurat_dims) + 0.5, y = Inf,
+           label = paste0("PC1–", max(cfg$seurat_dims), ": ",
+                          cum_var_10, "% variance"),
+           hjust = 0, vjust = 1.5, color = "red", size = 4) +
+  labs(title = "PCA Elbow Plot — host genes",
+       x = "Principal component", y = "Standard deviation") +
+  theme_classic(base_size = 14) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+ggsave(file.path(cfg$out_dir, "PCA_elbow_plot.pdf"),
+       plot = p_elbow, width = 7, height = 5)
+ggsave(file.path(cfg$out_dir, "PCA_elbow_plot.png"),
+       plot = p_elbow, width = 7, height = 5, dpi = 300)
+
+msg("Elbow plot saved. Inspect it and update cfg$seurat_dims if needed.")
+
+# Clustering (uses cfg$seurat_dims set above)
+pbmc <- RunUMAP(pbmc, dims = cfg$seurat_dims, verbose = FALSE)
+pbmc <- FindNeighbors(pbmc, dims = cfg$seurat_dims, verbose = FALSE)
+pbmc <- FindClusters(pbmc, resolution = cfg$seurat_resolution, verbose = FALSE)
+
+pbmc.markers <- FindAllMarkers(pbmc, only.pos = TRUE,
+                               min.pct = 0.1, logfc.threshold = 0.25,
+                               verbose = FALSE)
+write.table(pbmc.markers, file.path(cfg$out_dir, "cluster_markers.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+msg("Clustering done: %d clusters found.", length(levels(Idents(pbmc))))
+
+
+## ============================================================
+## 4b) GO & KEGG PATHWAY ENRICHMENT (host cluster markers)
+##
+## Requires:
+##   BiocManager::install(c("clusterProfiler", "org.Mm.eg.db", "enrichplot"))
+##   Use org.Hs.eg.db instead if analysing human data.
+## ============================================================
+
+if (has_pkg("clusterProfiler") && has_pkg("org.Mm.eg.db")) {
+
+  library(clusterProfiler)
+  library(org.Mm.eg.db)
+
+  safe_mkdir(file.path(cfg$out_dir, "enrichment"))
+
+  # Significant markers across all clusters
+  sig_markers <- pbmc.markers %>%
+    filter(p_val_adj < 0.05, avg_log2FC > 0.25) %>%
+    filter(!grepl("^(Gm|mt-|Rn18s)", gene))
+
+  gene_df <- clusterProfiler::bitr(
+    unique(sig_markers$gene),
+    fromType = "SYMBOL",
+    toType   = "ENTREZID",
+    OrgDb    = org.Mm.eg.db
+  )
+
+  # ---- GO enrichment (Biological Process) ----
+  go_res <- clusterProfiler::enrichGO(
+    gene          = gene_df$ENTREZID,
+    OrgDb         = org.Mm.eg.db,
+    keyType       = "ENTREZID",
+    ont           = "BP",
+    pAdjustMethod = "BH",
+    pvalueCutoff  = 0.05,
+    qvalueCutoff  = 0.05,
+    readable      = TRUE
+  )
+
+  # ---- KEGG enrichment ----
+  kegg_res <- clusterProfiler::enrichKEGG(
+    gene          = gene_df$ENTREZID,
+    organism      = "mmu",        # mmu = mouse; hsa = human
+    pAdjustMethod = "BH",
+    pvalueCutoff  = 0.05
+  )
+  kegg_res <- clusterProfiler::setReadable(kegg_res, OrgDb = org.Mm.eg.db,
+                                           keyType = "ENTREZID")
+
+  # ---- Save result tables ----
+  write.table(as.data.frame(go_res),
+              file.path(cfg$out_dir, "enrichment", "GO_BP_results.tsv"),
+              sep = "\t", quote = FALSE, row.names = FALSE)
+  write.table(as.data.frame(kegg_res),
+              file.path(cfg$out_dir, "enrichment", "KEGG_results.tsv"),
+              sep = "\t", quote = FALSE, row.names = FALSE)
+
+  # ---- Visualize: dotplots ----
+  n_show <- 20   # number of terms to display
+
+  p_go_dot <- dotplot(go_res, showCategory = n_show) +
+    ggtitle("GO Enrichment — Biological Process") +
+    theme_bw(base_size = 13) +
+    theme(plot.title  = element_text(hjust = 0.5, face = "bold"),
+          axis.text.y = element_text(size = 10))
+
+  p_kegg_dot <- dotplot(kegg_res, showCategory = n_show) +
+    ggtitle("KEGG Pathway Enrichment") +
+    theme_bw(base_size = 13) +
+    theme(plot.title  = element_text(hjust = 0.5, face = "bold"),
+          axis.text.y = element_text(size = 10))
+
+  # ---- Visualize: barplots (ggplot2) ----
+  go_top <- as.data.frame(go_res) %>%
+    slice_head(n = n_show) %>%
+    mutate(Description = factor(Description, levels = rev(Description)))
+
+  p_go_bar <- ggplot(go_top, aes(x = Count, y = Description, fill = p.adjust)) +
+    geom_bar(stat = "identity") +
+    scale_fill_gradient(low = "#d73027", high = "#91bfdb",
+                        name = "Adjusted\np-value") +
+    labs(title = "GO Enrichment — Biological Process",
+         x = "Gene count", y = NULL) +
+    theme_classic(base_size = 13) +
+    theme(plot.title  = element_text(hjust = 0.5, face = "bold"),
+          axis.text.y = element_text(size = 10))
+
+  kegg_top <- as.data.frame(kegg_res) %>%
+    slice_head(n = n_show) %>%
+    mutate(Description = factor(Description, levels = rev(Description)))
+
+  p_kegg_bar <- ggplot(kegg_top, aes(x = Count, y = Description, fill = p.adjust)) +
+    geom_bar(stat = "identity") +
+    scale_fill_gradient(low = "#d73027", high = "#91bfdb",
+                        name = "Adjusted\np-value") +
+    labs(title = "KEGG Pathway Enrichment",
+         x = "Gene count", y = NULL) +
+    theme_classic(base_size = 13) +
+    theme(plot.title  = element_text(hjust = 0.5, face = "bold"),
+          axis.text.y = element_text(size = 10))
+
+  # ---- Save plots ----
+  ggsave(file.path(cfg$out_dir, "enrichment", "GO_dotplot.pdf"),
+         plot = p_go_dot,   width = 10, height = 8)
+  ggsave(file.path(cfg$out_dir, "enrichment", "GO_barplot.pdf"),
+         plot = p_go_bar,   width = 10, height = 8)
+  ggsave(file.path(cfg$out_dir, "enrichment", "KEGG_dotplot.pdf"),
+         plot = p_kegg_dot, width = 10, height = 8)
+  ggsave(file.path(cfg$out_dir, "enrichment", "KEGG_barplot.pdf"),
+         plot = p_kegg_bar, width = 10, height = 8)
+
+  msg("GO and KEGG enrichment saved to results/enrichment/")
+
+} else {
+  msg("clusterProfiler or org.Mm.eg.db not installed — skipping enrichment.")
+  msg("Install with: BiocManager::install(c('clusterProfiler','org.Mm.eg.db'))")
+}
+
+
+## ============================================================
+## 5) PER-SPECIES SPATIAL UMI MAPS  (update cfg$seurat_dims first if needed)
 ## ============================================================
 
 safe_mkdir(file.path(cfg$out_dir, "species_maps"))
